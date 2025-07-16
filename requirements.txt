@@ -1,0 +1,12 @@
+telethon
+requests
+pillow
+aiohttp
+sseclient-py
+urllib3
+nest-asyncio
+sseclient
+scheduler
+apscheduler
+flask
+pytz

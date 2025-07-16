@@ -1,0 +1,719 @@
+import asyncio
+import logging
+import os
+import time
+import hashlib
+import shutil
+import re
+import sqlite3
+import uuid
+from datetime import datetime, timedelta
+from typing import Dict, Set, Optional, List, Tuple
+from telethon import TelegramClient, events, Button
+from telethon.tl.functions.users import GetFullUserRequest
+from telethon.tl.types import DocumentAttributeFilename
+from telethon.utils import get_display_name
+from telethon.errors import UserIsBlockedError
+import nest_asyncio
+
+# Corrige problemas de event loop
+nest_asyncio.apply()
+
+# Configuração de logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Configurações do bot
+API_ID = 25317254
+API_HASH = 'bef2f48bb6b4120c9189ecfd974eb820'
+BOT_TOKEN = '7369466703:AAHALdZSqvCVkfyhs6sW-JoHkrnX0r9e7Rw'
+SUPPORT_CHAT = '@darack_support'
+ADMIN_ID = 6919117453  # ID do administrador principal
+
+# Configurações de diretórios
+DB_PATH = "./database/bot_data.db"
+TEMP_DIR = "./temp_files"
+RESULTS_DIR = "./results"
+BANNER_PATH = "./assets/banner_start.png"
+
+# Criar diretórios necessários
+os.makedirs(TEMP_DIR, exist_ok=True)
+os.makedirs(RESULTS_DIR, exist_ok=True)
+os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+
+# Lista de administradores
+ADMINS = [ADMIN_ID, 123456789]  # Adicione mais IDs conforme necessário
+
+# Variáveis globais
+usuarios_bloqueados: Set[int] = set()
+usuarios_autorizados: Dict[int, str] = {}
+mensagens_origem: Dict[int, int] = {}
+urls_busca: Dict[int, str] = {}
+tasks_canceladas: Dict[str, Dict[str, bool]] = {}
+affiliate_codes: Dict[str, int] = {}  # código -> user_id
+
+class Database:
+    def __init__(self):
+        self.db_path = DB_PATH
+        self.init_db()
+
+    def init_db(self):
+        """Inicializa o banco de dados"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+
+            # Tabela de usuários
+            cursor.execute('''CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                hash TEXT,
+                created_at TEXT,
+                expires_at TEXT,
+                plan_type TEXT DEFAULT 'free',
+                is_authorized BOOLEAN DEFAULT FALSE,
+                is_banned BOOLEAN DEFAULT FALSE,
+                is_admin BOOLEAN DEFAULT FALSE,
+                search_count INTEGER DEFAULT 0,
+                last_activity TEXT,
+                affiliate_code TEXT,
+                referrer_id INTEGER,
+                commission_earned REAL DEFAULT 0.0,
+                commission_paid REAL DEFAULT 0.0
+            )''')
+
+            # Tabela de tokens
+            cursor.execute('''CREATE TABLE IF NOT EXISTS tokens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                token TEXT UNIQUE,
+                plan_type TEXT,
+                duration_days INTEGER,
+                is_used BOOLEAN DEFAULT FALSE,
+                used_by INTEGER,
+                created_at TEXT,
+                used_at TEXT
+            )''')
+
+            # Tabela de buscas
+            cursor.execute('''CREATE TABLE IF NOT EXISTS searches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                domain TEXT,
+                results_count INTEGER,
+                search_date TEXT,
+                FOREIGN KEY (user_id) REFERENCES users (id)
+            )''')
+
+            # Tabela de arquivos processados
+            cursor.execute('''CREATE TABLE IF NOT EXISTS processed_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                filename TEXT,
+                processed_lines INTEGER,
+                unique_domains INTEGER,
+                processed_at TEXT
+            )''')
+
+            conn.commit()
+
+class UserManager:
+    def __init__(self, db: Database):
+        self.db = db
+
+    async def register_user(self, user_id: int, username: str = None, 
+                          first_name: str = None, last_name: str = None):
+        """Registra um usuário no banco de dados"""
+        user_hash = hashlib.md5(f"{first_name or ''}{user_id}".encode()).hexdigest()[:8]
+        now = datetime.now().isoformat()
+
+        # Gera código de afiliado único
+        affiliate_code = str(uuid.uuid4())[:8]
+
+        with sqlite3.connect(self.db.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''INSERT OR IGNORE INTO users 
+                (id, username, first_name, last_name, hash, created_at, affiliate_code)
+                VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                (user_id, username, first_name, last_name, user_hash, now, affiliate_code))
+            conn.commit()
+
+    async def get_user_info(self, user_id: int) -> Optional[Dict]:
+        """Obtém informações do usuário"""
+        with sqlite3.connect(self.db.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+            row = cursor.fetchone()
+
+            if row:
+                return {
+                    'id': row[0],
+                    'username': row[1],
+                    'first_name': row[2],
+                    'last_name': row[3],
+                    'hash': row[4],
+                    'created_at': row[5],
+                    'expires_at': row[6],
+                    'plan_type': row[7],
+                    'is_authorized': bool(row[8]),
+                    'is_banned': bool(row[9]),
+                    'is_admin': bool(row[10]),
+                    'search_count': row[11],
+                    'last_activity': row[12],
+                    'affiliate_code': row[13],
+                    'referrer_id': row[14],
+                    'commission_earned': row[15],
+                    'commission_paid': row[16]
+                }
+        return None
+
+    async def is_authorized(self, user_id: int) -> bool:
+        """Verifica se o usuário está autorizado"""
+        user_info = await self.get_user_info(user_id)
+        if not user_info:
+            return False
+
+        if user_info['is_admin']:
+            return True
+
+        if not user_info['is_authorized']:
+            return False
+
+        # Verifica se o plano ainda está válido
+        if user_info['expires_at']:
+            expires_at = datetime.fromisoformat(user_info['expires_at'])
+            if datetime.now() > expires_at:
+                # Plano expirado
+                with sqlite3.connect(self.db.db_path) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "UPDATE users SET is_authorized = FALSE, plan_type = 'free' WHERE id = ?",
+                        (user_id,)
+                    )
+                    conn.commit()
+                return False
+
+        return True
+
+    async def update_search_count(self, user_id: int):
+        """Atualiza contador de buscas do usuário"""
+        with sqlite3.connect(self.db.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE users SET search_count = search_count + 1, last_activity = ? WHERE id = ?",
+                (datetime.now().isoformat(), user_id)
+            )
+            conn.commit()
+
+class TokenManager:
+    def __init__(self, db: Database):
+        self.db = db
+
+    async def generate_token(self, plan_type: str, duration_days: int) -> str:
+        """Gera um novo token"""
+        token = str(uuid.uuid4())
+        now = datetime.now().isoformat()
+
+        with sqlite3.connect(self.db.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''INSERT INTO tokens 
+                (token, plan_type, duration_days, created_at)
+                VALUES (?, ?, ?, ?)''',
+                (token, plan_type, duration_days, now))
+            conn.commit()
+
+        return token
+
+    async def redeem_token(self, token: str, user_id: int) -> Dict:
+        """Resgata um token"""
+        with sqlite3.connect(self.db.db_path) as conn:
+            cursor = conn.cursor()
+
+            # Verifica se o token existe e não foi usado
+            cursor.execute("SELECT * FROM tokens WHERE token = ? AND is_used = FALSE", (token,))
+            token_info = cursor.fetchone()
+
+            if not token_info:
+                return {'success': False, 'message': 'Token inválido ou já utilizado'}
+
+            # Calcula data de expiração
+            expires_at = datetime.now() + timedelta(days=token_info[3])
+
+            # Atualiza o usuário
+            cursor.execute('''UPDATE users SET 
+                is_authorized = TRUE, 
+                plan_type = ?, 
+                expires_at = ? 
+                WHERE id = ?''',
+                (token_info[2], expires_at.isoformat(), user_id))
+
+            # Marca o token como usado
+            cursor.execute('''UPDATE tokens SET 
+                is_used = TRUE, 
+                used_by = ?, 
+                used_at = ? 
+                WHERE token = ?''',
+                (user_id, datetime.now().isoformat(), token))
+
+            conn.commit()
+
+            return {
+                'success': True,
+                'plan_type': token_info[2],
+                'expires_at': expires_at.strftime('%d/%m/%Y %H:%M')
+            }
+
+class SearchManager:
+    def __init__(self, db: Database):
+        self.db = db
+
+    def validate_domain(self, domain: str) -> bool:
+        """Valida se o domínio é válido"""
+        if not domain or not domain.strip():
+            return False
+
+        domain = domain.strip()
+        if ' ' in domain:
+            return False
+
+        # Remove protocolo se presente
+        if domain.startswith(('http://', 'https://')):
+            domain = domain.split('://', 1)[1]
+
+        # Padrão básico de validação de domínio
+        pattern = re.compile(
+            r'^([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$'
+        )
+
+        return bool(pattern.match(domain))
+
+    async def search_domain(self, domain: str, user_id: int, callback=None) -> Dict:
+        """Realiza busca no domínio"""
+        if not self.validate_domain(domain):
+            return {'success': False, 'message': 'Domínio inválido'}
+
+        # Cria pasta temporária para o usuário
+        user_temp_dir = os.path.join(TEMP_DIR, str(user_id))
+        os.makedirs(user_temp_dir, exist_ok=True)
+
+        # Simula busca de dados (substitua pela implementação real)
+        await self.simulate_search(domain, user_id, user_temp_dir, callback)
+
+        # Verifica se encontrou resultados
+        raw_file = os.path.join(user_temp_dir, f"{user_id}.txt")
+        formatted_file = os.path.join(user_temp_dir, f"{user_id}_formatted.txt")
+
+        if not os.path.exists(raw_file):
+            return {'success': False, 'message': 'Nenhum resultado encontrado'}
+
+        # Conta resultados
+        with open(raw_file, 'r', encoding='utf-8') as f:
+            count = sum(1 for line in f if line.strip())
+
+        if count == 0:
+            return {'success': False, 'message': 'Nenhum resultado encontrado'}
+
+        # Registra a busca
+        with sqlite3.connect(self.db.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''INSERT INTO searches 
+                (user_id, domain, results_count, search_date)
+                VALUES (?, ?, ?, ?)''',
+                (user_id, domain, count, datetime.now().isoformat()))
+            conn.commit()
+
+        return {
+            'success': True,
+            'count': count,
+            'raw_file': raw_file,
+            'formatted_file': formatted_file,
+            'domain': domain
+        }
+
+    async def simulate_search(self, domain: str, user_id: int, temp_dir: str, callback=None):
+        """Simula busca de dados - substitua pela implementação real"""
+        # Dados fictícios para demonstração
+        mock_data = [
+            f"user1@{domain}:password123",
+            f"user2@{domain}:password456",
+            f"admin@{domain}:admin123",
+            f"test@{domain}:test456",
+            f"support@{domain}:support789"
+        ]
+
+        # Simula progresso
+        for i in range(100):
+            if callback:
+                callback(i)
+            await asyncio.sleep(0.05)  # Simula processamento
+
+        # Cria arquivo bruto
+        raw_file = os.path.join(temp_dir, f"{user_id}.txt")
+        with open(raw_file, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(mock_data))
+
+        # Cria arquivo formatado
+        formatted_file = os.path.join(temp_dir, f"{user_id}_formatted.txt")
+        with open(formatted_file, 'w', encoding='utf-8') as f:
+            for line in mock_data:
+                if ':' in line:
+                    email, password = line.split(':', 1)
+                    f.write(f"Email: {email}\nSenha: {password}\n{'='*40}\n")
+
+class DarackBot:
+    def __init__(self):
+        self.client = TelegramClient('darack_bot', API_ID, API_HASH)
+        self.db = Database()
+        self.user_manager = UserManager(self.db)
+        self.token_manager = TokenManager(self.db)
+        self.search_manager = SearchManager(self.db)
+
+        # Registra handlers
+        self.register_handlers()
+
+    def register_handlers(self):
+        """Registra todos os handlers do bot"""
+
+        @self.client.on(events.NewMessage(pattern=r'^/start$'))
+        async def start_handler(event):
+            await self.handle_start(event)
+
+        @self.client.on(events.NewMessage(pattern=r'^/start aff_(.+)'))
+        async def start_affiliate_handler(event):
+            await self.handle_start_affiliate(event)
+
+        @self.client.on(events.NewMessage(pattern=r'^/search (.+)'))
+        async def search_handler(event):
+            await self.handle_search(event)
+
+        @self.client.on(events.NewMessage(pattern=r'^/resgatar (.+)'))
+        async def redeem_handler(event):
+            await self.handle_redeem_token(event)
+
+        @self.client.on(events.NewMessage(pattern=r'^/reset$'))
+        async def reset_handler(event):
+            await self.handle_reset(event)
+
+        @self.client.on(events.NewMessage(pattern=r'^/afiliado$'))
+        async def affiliate_handler(event):
+            await self.handle_affiliate(event)
+
+        # Comandos administrativos
+        @self.client.on(events.NewMessage(pattern=r'^/gerar_token (\w+) (\d+)$'))
+        async def generate_token_handler(event):
+            await self.handle_generate_token(event)
+
+        @self.client.on(events.NewMessage(pattern=r'^/autorizar (\d+) (\d+)$'))
+        async def authorize_handler(event):
+            await self.handle_authorize_user(event)
+
+        @self.client.on(events.NewMessage(pattern=r'^/info (\d+)$'))
+        async def info_handler(event):
+            await self.handle_user_info(event)
+
+        @self.client.on(events.CallbackQuery)
+        async def callback_handler(event):
+            await self.handle_callback(event)
+
+    async def handle_start(self, event):
+        """Handler para comando /start"""
+        try:
+            user = await self.client(GetFullUserRequest(event.sender_id))
+            u = user.users[0]
+
+            # Registra o usuário
+            await self.user_manager.register_user(
+                user_id=u.id,
+                username=u.username,
+                first_name=u.first_name,
+                last_name=u.last_name
+            )
+
+            user_info = await self.user_manager.get_user_info(u.id)
+            mention = f"[{get_display_name(u)}](tg://user?id={u.id})"
+
+            # Determina o status do usuário
+            if user_info['is_admin']:
+                status = "ADMINISTRADOR"
+                buttons = await self.create_admin_menu(u.id)
+            elif user_info['is_authorized']:
+                status = user_info['plan_type'].upper()
+                buttons = await self.create_user_menu(u.id)
+            else:
+                status = "USUÁRIO LIVRE"
+                buttons = await self.create_free_menu(u.id)
+
+            welcome_text = f"""**🔥 BEM-VINDO AO BOT DARACK!**
+
+👤 **Usuário:** {mention}
+📊 **Status:** {status}
+⏰ **Expira em:** {user_info['expires_at'] or 'Não definido'}
+
+🎯 **Sobre o Bot:**
+O Bot Darack é sua ferramenta profissional para busca de dados de login. Oferecemos acesso a milhares de domínios com dados atualizados regularmente.
+
+💎 **Funcionalidades:**
+• Busca avançada por domínios
+• Sistema de afiliação com comissões
+• Suporte técnico especializado
+• Atualizações constantes da base de dados
+
+💡 **Aproveite o sistema de forma justa e responsável!**
+
+📞 **Suporte:** {SUPPORT_CHAT}
+
+🤖 @DarackServerRobot"""
+
+            if os.path.exists(BANNER_PATH):
+                await self.client.send_file(
+                    event.chat_id,
+                    file=BANNER_PATH,
+                    caption=welcome_text,
+                    buttons=buttons,
+                    reply_to=event.id
+                )
+            else:
+                await event.respond(welcome_text, buttons=buttons)
+
+        except Exception as e:
+            logger.error(f"Erro no start_handler: {e}")
+            await event.respond("❌ Erro interno. Tente novamente.")
+
+    async def handle_start_affiliate(self, event):
+        """Handler para links de afiliação"""
+        affiliate_code = event.pattern_match.group(1)
+        # Implementar lógica de afiliação aqui
+        await self.handle_start(event)
+
+    async def handle_search(self, event):
+        """Handler para busca de domínios"""
+        try:
+            domain = event.pattern_match.group(1).strip()
+            user_id = event.sender_id
+
+            # Verifica autorização
+            if not await self.user_manager.is_authorized(user_id):
+                await event.respond(
+                    "❌ **ACESSO NEGADO!**\n\n"
+                    "Você precisa de um plano ativo para realizar buscas.\n"
+                    "Use `/start` para ver as opções disponíveis.",
+                    buttons=[[Button.inline("❌ | APAGAR", data=f"delete:{user_id}")]]
+                )
+                return
+
+            # Verifica se não está bloqueado
+            if user_id in usuarios_bloqueados:
+                await event.respond(
+                    "⛔ **AGUARDE ATÉ QUE A PESQUISA SEJA CONCLUÍDA!**\n\n"
+                    "Use `/reset` para resetar suas informações.\n\n"
+                    "🤖 @DarackServerRobot",
+                    buttons=[[Button.inline("❌ | APAGAR", data=f"delete:{user_id}")]]
+                )
+                return
+
+            # Valida domínio
+            if not self.search_manager.validate_domain(domain):
+                await event.respond(
+                    "❌ **DOMÍNIO INVÁLIDO!**\n\n"
+                    "Exemplo: `/search google.com`\n\n"
+                    "🤖 @DarackServerRobot",
+                    buttons=[[Button.inline("❌ | APAGAR", data=f"delete:{user_id}")]]
+                )
+                return
+
+            # Bloqueia usuário durante busca
+            usuarios_bloqueados.add(user_id)
+            mensagens_origem[user_id] = event.id
+            urls_busca[user_id] = domain
+
+            hash_nome = str(user_id)
+            tasks_canceladas[hash_nome] = {'cancelled': False}
+
+            # Mensagem de progresso
+            progress_msg = await event.respond(
+                "**☁️ | PROCURANDO DADOS...**\n\n"
+                f"**🔍 Domínio:** `{domain}`\n"
+                f"**[♦️] Logins encontrados:** `0`\n\n"
+                "🤖 @DarackServerRobot",
+                buttons=[
+                    [Button.inline("🚫 | PARAR", data=f"cancel_search:{user_id}")],
+                    [Button.inline("❌ | APAGAR", data=f"delete:{user_id}")]
+                ]
+            )
+
+            # Callback para atualizar progresso
+            contador = 0
+
+            def update_counter(value):
+                nonlocal contador
+                contador = value
+
+            # Tarefa para atualizar mensagem
+            async def update_progress():
+                while not tasks_canceladas[hash_nome]['cancelled']:
+                    try:
+                        await progress_msg.edit(
+                            f"**☁️ | PROCURANDO DADOS...**\n\n"
+                            f"**🔍 Domínio:** `{domain}`\n"
+                            f"**[♦️] Logins encontrados:** `{contador}`\n\n"
+                            "🤖 @DarackServerRobot",
+                            buttons=[
+                                [Button.inline("🚫 | PARAR", data=f"cancel_search:{user_id}")],
+                                [Button.inline("❌ | APAGAR", data=f"delete:{user_id}")]
+                            ]
+                        )
+                        await asyncio.sleep(2)
+                    except Exception:
+                        break
+
+            # Inicia busca
+            update_task = asyncio.create_task(update_progress())
+
+            result = await self.search_manager.search_domain(domain, user_id, update_counter)
+
+            # Cancela tarefa de atualização
+            tasks_canceladas[hash_nome]['cancelled'] = True
+            update_task.cancel()
+
+            if not result['success']:
+                await progress_msg.edit(
+                    f"❌ **NENHUM RESULTADO ENCONTRADO!**\n\n"
+                    f"**🔍 Domínio:** `{domain}`\n\n"
+                    "🤖 @DarackServerRobot",
+                    buttons=[[Button.inline("❌ | APAGAR", data=f"delete:{user_id}")]]
+                )
+                usuarios_bloqueados.discard(user_id)
+                return
+
+            # Atualiza contador de buscas
+            await self.user_manager.update_search_count(user_id)
+
+            # Mostra opções de formato
+            await progress_msg.edit(
+                f"**☁️ | RESULTADOS ENCONTRADOS: {result['count']}**\n\n"
+                f"**🔍 Domínio:** `{domain}`\n"
+                f"**QUAL FORMATO VOCÊ ESCOLHE:**\n\n"
+                "🤖 @DarackServerRobot",
+                buttons=[
+                    [
+                        Button.inline("🔻 | USER:PASS", data=f"format_raw:{user_id}"),
+                        Button.inline("📄 | FORMATADO", data=f"format_formatted:{user_id}")
+                    ],
+                    [Button.inline("❌ | CANCELAR", data=f"cancel_result:{user_id}")]
+                ]
+            )
+
+            usuarios_bloqueados.discard(user_id)
+
+        except Exception as e:
+            logger.error(f"Erro na busca: {e}")
+            usuarios_bloqueados.discard(user_id)
+            await event.respond("❌ Erro interno durante a busca.")
+
+    async def handle_redeem_token(self, event):
+        """Handler para resgate de tokens"""
+        try:
+            token = event.pattern_match.group(1).strip()
+            user_id = event.sender_id
+
+            result = await self.token_manager.redeem_token(token, user_id)
+
+            if result['success']:
+                await event.respond(
+                    f"✅ **TOKEN RESGATADO COM SUCESSO!**\n\n"
+                    f"🎁 **Plano:** {result['plan_type'].upper()}\n"
+                    f"⏰ **Válido até:** {result['expires_at']}\n\n"
+                    f"Agora você tem acesso completo ao bot!\n\n"
+                    "🤖 @DarackServerRobot",
+                    buttons=[[Button.inline("❌ | APAGAR", data=f"delete:{user_id}")]]
+                )
+            else:
+                await event.respond(
+                    f"❌ **ERRO AO RESGATAR TOKEN:**\n\n"
+                    f"{result['message']}\n\n"
+                    "🤖 @DarackServerRobot",
+                    buttons=[[Button.inline("❌ | APAGAR", data=f"delete:{user_id}")]]
+                )
+
+        except Exception as e:
+            logger.error(f"Erro no resgate de token: {e}")
+            await event.respond("❌ Erro interno ao resgatar token.")
+
+    async def handle_reset(self, event):
+        """Handler para reset de dados do usuário"""
+        try:
+            user_id = event.sender_id
+            hash_nome = str(user_id)
+
+            # Limpa dados do usuário
+            tasks_canceladas.pop(hash_nome, None)
+            usuarios_bloqueados.discard(user_id)
+            usuarios_autorizados.pop(user_id, None)
+            mensagens_origem.pop(user_id, None)
+            urls_busca.pop(user_id, None)
+
+            # Remove pasta temporária
+            user_temp_dir = os.path.join(TEMP_DIR, str(user_id))
+            if os.path.exists(user_temp_dir):
+                shutil.rmtree(user_temp_dir, ignore_errors=True)
+
+            await event.respond(
+                "✅ **DADOS RESETADOS COM SUCESSO!**\n\n"
+                "Agora você pode utilizar os comandos novamente.\n\n"
+                "🤖 @DarackServerRobot",
+                buttons=[[Button.inline("❌ | APAGAR", data=f"delete:{user_id}")]]
+            )
+
+        except Exception as e:
+            logger.error(f"Erro no reset: {e}")
+            await event.respond("❌ Erro ao resetar dados.")
+
+    async def handle_affiliate(self, event):
+        """Handler para painel de afiliação"""
+        try:
+            user_id = event.sender_id
+
+            if not await self.user_manager.is_authorized(user_id):
+                await event.respond(
+                    "❌ **ACESSO NEGADO!**\n\n"
+                    "Você precisa de um plano ativo para acessar o programa de afiliação.",
+                    buttons=[[Button.inline("❌ | APAGAR", data=f"delete:{user_id}")]]
+                )
+                return
+
+            user_info = await self.user_manager.get_user_info(user_id)
+            bot_info = await self.client.get_me()
+
+            affiliate_text = f"""💰 **PAINEL DE AFILIAÇÃO**
+
+👥 **Seus Números:**
+• Código: `{user_info['affiliate_code']}`
+• Comissões acumuladas: R$ {user_info['commission_earned']:.2f}
+• Comissões pagas: R$ {user_info['commission_paid']:.2f}
+
+🔗 **Seu Link:**
+`https://t.me/{bot_info.username}?start=aff_{user_info['affiliate_code']}`
+
+📊 **Como Funciona:**
+• Compartilhe seu link
+• Ganhe 30% por cada venda
+• Saque mínimo: R$ 50,00
+• Pagamento via PIX em 48h
+
+🤖 @DarackServerRobot"""
+
+            buttons = [
+                [Button.inline("💸 | SOLICITAR SAQUE", data=f"request_payout:{user_id}")],
+                [Button.inline("📈 | ESTATÍSTICAS", data=f"affiliate_stats:{user_id}")],
+                [Button.inline("❌ | APAGAR", data=f"delete:{user_id}")]
+            ]
+
+            await event.respond(affiliate_text, buttons=buttons)
+
+        except Exception as e:
+            logger.error(f"Erro no painel de afiliação: {e}")
+            await event.respond("❌ Erro interno.")
+
+    async
